@@ -70,17 +70,53 @@ def get_sqlserver_tbl_struct(tbl_name):
     cursor.close()
     conn.close()
     return data
+
+
 def get_tbl_names():
     db_conf = conf['db_info']
     db_type = db_conf['db_type']
     if db_type == 'mysql':
         return get_mysql_tbl_names()
     elif db_type == 'oracle':
-        raise Exception('oracle还不支持自动获取表名，需要自己手工定义word_def.tables')
+        return get_oracle_tbl_names()
     elif db_type == 'sqlserver':
         raise Exception('sqlserver还不支持自动获取表名，需要自己手工定义word_def.tables')
     else:
-        raise Exception('不支持的数据库类型',db_type)
+        raise Exception('不支持的数据库类型', db_type)
+
+
+def get_oracle_tbl_names():
+    tbl_names = []
+    # 链接数据库
+    import cx_Oracle
+    db_conf = conf['db_info']
+
+    conn = cx_Oracle.connect(
+        '%s/%s@%s:%s/%s' % (db_conf['user'], db_conf['password'], db_conf['host'], db_conf['port'], db_conf['db']))
+
+    # 第二步：创建游标对象
+    cursor = conn.cursor()  # cursor当前的程序到数据之间连接管道
+    # 第三步：组装sql语句
+    sql = 'select a.table_name, b.comments ' \
+          'from user_tables a inner join user_tab_comments b ' \
+          'on a.table_name=b.table_name ' \
+          'order by a.table_name'
+    # 第四步：执行sql语句
+    cursor.execute(sql)
+    # 从游标中取出所有记录放到一个序列中并关闭游标
+    result = cursor.fetchall()
+
+    for item in list(result):
+        if item[1]:
+            tbl_names.append('__'.join(item))
+        else:
+            tbl_names.append(item[0])
+
+    # 关闭游标
+    cursor.close()
+    conn.close()
+    return tbl_names
+
 
 def get_mysql_tbl_names():
     """通过information_schema.TABLES, 读取表名，格式为{表名}__{备注}
@@ -114,6 +150,7 @@ def get_mysql_tbl_names():
     conn.close()
     print(data)
     return data
+
 
 def get_mysql_tbl_struct(tbl_name):
     """通过information_schema.COLUMNS, 读取表结构信息
@@ -149,34 +186,54 @@ def get_mysql_tbl_struct(tbl_name):
     conn.close()
     return data
 
+
 def get_oracle_tbl_struct(tbl_name):
-    """通过information_schema.COLUMNS, 读取表结构信息
-    """
     # 链接数据库
     import cx_Oracle
     db_conf = conf['db_info']
-    db_name = db_conf['db']
-
 
     conn = cx_Oracle.connect('%s/%s@%s:%s/%s' % (db_conf['user'], db_conf['password'], db_conf['host'], db_conf['port'], db_conf['db']))
 
     # 第二步：创建游标对象
     cursor = conn.cursor()  # cursor当前的程序到数据之间连接管道
     # 第三步：组装sql语句
-    # sql = f"select column_name,column_type,data_type,CHARACTER_MAXIMUM_LENGTH,is_nullable,column_comment from `information_schema`.`COLUMNS`  where `table_name` = '{tbl_name}' and `table_schema` = '{db_name}' order by ordinal_position"
-    sql=f"""
-            SELECT
-                    A.COLUMN_NAME AS "字段名",
-                    DECODE(A.CHAR_LENGTH,
-                           0,CASE WHEN A.DATA_SCALE IS NULL OR A.DATA_PRECISION IS NULL THEN A.DATA_TYPE ELSE A.DATA_TYPE || '(' || A.DATA_PRECISION || ',' ||A.DATA_SCALE || ')' END,
-                           A.DATA_TYPE || '(' || A.CHAR_LENGTH || ')') as "类型",
-                    A.CHAR_LENGTH AS "字节",
-                    '' as "主键",
-                    A.NULLABLE AS "能否为空",
-                    B.COMMENTS AS "字段注释"
-                    FROM sys.user_tab_columns A
-                    INNER JOIN USER_COL_COMMENTS B ON A.TABLE_NAME = B.TABLE_NAME AND A.COLUMN_NAME = B.COLUMN_NAME
-            WHERE A.TABLE_NAME='"""+tbl_name+"""'
+    sql = f"""
+            select "字段名称","数据类型","长度","是否为空","字段说明","默认值",Concat(CONCAT("主键表名",'.'),"主键列名") as "外键约束" from (
+                SELECT t1.Table_Name AS "表名称",
+                t3.comments AS "表说明",
+                t1.Column_Name AS "字段名称",
+                t1.Data_Type AS "数据类型",
+                t1.Data_Length AS "长度",
+                t1.NullAble AS "是否为空",
+                t2.Comments AS "字段说明",
+                t1.Data_Default "默认值",
+                t4.主键表名 AS 主键表名,
+                t4.主键列名 as 主键列名
+                FROM cols t1 left join user_col_comments t2
+                on t1.Table_name=t2.Table_name and t1.Column_Name=t2.Column_Name
+                left join user_tab_comments t3
+                on t1.Table_name=t3.Table_name
+                left join (
+                    select distinct aa.table_name 外键表名,aa.column_name 外键列名,bb.table_name 主键表名,bb.column_name 主键列名
+                    from
+                    (select a.constraint_name,b.table_name,b.column_name,a.r_constraint_name
+                    from user_constraints a, user_cons_columns b
+                    WHERE a.constraint_type='R'
+                    and a.constraint_name=b.constraint_name
+                    ) aa,
+                    (select a.r_constraint_name,b.table_name,b.column_name
+                    from user_constraints a, user_cons_columns b where a.constraint_type='R' and
+                    a.r_constraint_name=b.constraint_name)
+                    bb
+                    where aa.r_constraint_name=bb.r_constraint_name
+                ) t4
+                on t1.Table_name=t4.外键表名 and t1.Column_Name=t4.外键列名 and t3.Table_name = t4.外键表名 and t2.Table_name = t4.外键表名
+                WHERE NOT EXISTS ( SELECT t4.Object_Name FROM User_objects t4
+                    WHERE t4.Object_Type='TABLE'
+                    AND t4.Temporary='Y'
+                    AND t4.Object_Name=t1.Table_Name )
+                ORDER BY t1.Table_Name, t1.Column_ID
+            )k where k."表名称" = '{tbl_name}'
         """
     # 第四步：执行sql语句
     cursor.execute(sql)
@@ -184,17 +241,19 @@ def get_oracle_tbl_struct(tbl_name):
     result = cursor.fetchall()
     # 查询表的结构
     fields = list(result)
-    # 列名	数据类型	字段类型	长度	是否为空	默认值	备注
-    # print('|列名|数据类型|字段类型|长度|是否为空|备注|'.replace('|',','))
-    data = ['字段名|类型|字节|主键|是否可为空|字段说明'.split('|')]
+    data = ['字段名称|数据类型|长度|是否可为空|字段说明|默认值|外键约束'.split('|')]
     # print('|--|--|--|--|--|--|')
-    for f in fields:
-        s = [str(i) if i is not None else '' for i in f]
-        data.append(s)
+    for field in fields:
+        arr = list(field)
+        if arr[-1] == '.':
+            arr[-1] = ''
+        data.append(arr)
+    print(data)
     # 关闭游标
     cursor.close()
     conn.close()
     return data
+
 
 def insert_after_paragraph(_p1, _p2):
     """在docx中做插入操作
@@ -225,7 +284,7 @@ def createDocxTable(items, document):
     """
 
     # 表字段长度
-    column_len_def = [2.8, 2.5, 2.5, 1.5, 2.0, 5.0]
+    column_len_def = [2.8, 2.5, 1.5, 1.5, 2.5, 2.0, 2.0]
 
     # add table ------------------
     colunm_len = len(items[0])
@@ -259,13 +318,12 @@ def createDocxTable(items, document):
 
 
 def read_db_write_docx():
-
     # 往word中写入表格内容,可以支持多个段落定义
     for section in conf['word_def']:
         anchor = section['anchor']
         tables = section.get('tables',[])
         if not tables:
-            tables =  get_tbl_names()
+            tables = get_tbl_names()
         p = find_anchor_paragraph(anchor)
         new_style = get_next_level_style(p)
         for t in tables:
@@ -273,11 +331,11 @@ def read_db_write_docx():
             if '__' in t:
                 tbl_name, tbl_name_chs = t.split('__')  # 表名和中文名要用下划线分开
             else:
-                tbl_name,tbl_name_chs = t,''
+                tbl_name, tbl_name_chs = t, ''
             if tbl_name_chs:
                 display_name = f'{tbl_name}({tbl_name_chs})'
             else:
-                display_name =tbl_name
+                display_name = tbl_name
             x = document.add_paragraph(display_name, style=new_style)
             insert_after_paragraph(p, x)
 
@@ -288,8 +346,8 @@ def read_db_write_docx():
             insert_after_paragraph(x, docx_t)
             p = docx_t
 
+
 if __name__ == '__main__':
-    # get_mysql_tbl_names()
     document = Document(conf['template'])
     read_db_write_docx()
     document.save(conf['output'])
